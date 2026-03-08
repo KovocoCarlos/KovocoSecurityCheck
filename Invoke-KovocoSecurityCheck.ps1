@@ -227,12 +227,13 @@ SELECT 'Ole Automation Procedures are enabled.' AS details,
 FROM sys.configurations WHERE name = 'Ole Automation Procedures' AND value_in_use = 1
 "@ }
 
-    @{ id=2006; name="Remote Access (deprecated)"; category="Configuration & Surface Area"; severity="Medium"
-       description="Checks whether the deprecated Remote Access configuration is enabled."
+    @{ id=2006; name="Remote Access enabled without linked servers"; category="Configuration & Surface Area"; severity="Low"
+       description="Checks whether the Remote Access setting is enabled when no linked servers exist. Remote Access allows remote stored procedure calls between servers, but defaults to ON even in new installations. It is only needed for linked server or log shipping RPC scenarios."
        query=@"
-SELECT 'Remote Access is enabled (deprecated since SQL 2008).' AS details,
-    'Disable. This setting will be removed in a future SQL Server version.' AS actionStep
-FROM sys.configurations WHERE name = 'remote access' AND value_in_use = 1
+IF (SELECT value_in_use FROM sys.configurations WHERE name = 'remote access') = 1
+   AND NOT EXISTS (SELECT 1 FROM sys.servers WHERE is_linked = 1)
+    SELECT 'Remote Access is enabled but no linked servers are configured. This setting allows remote stored procedure execution between servers and has been deprecated by Microsoft, though it still defaults to ON in new installations (including SQL Server 2025).' AS details,
+        'Since no linked servers exist on this instance, disable Remote Access: EXEC sp_configure ''remote access'', 0; RECONFIGURE; — Note: this requires a SQL Server restart to take effect.' AS actionStep;
 "@ }
 
     @{ id=2007; name="Database Mail XPs"; category="Configuration & Surface Area"; severity="Low"
@@ -283,13 +284,22 @@ IF @c > 0
 "@ }
 
     @{ id=2012; name="Error log retention"; category="Configuration & Surface Area"; severity="Low"
-       description="Checks the number of configured error log files. Too few means security events are lost quickly."
+       description="Checks the number of configured error log files and recommends retaining at least 6 months of history. The default is 6 files, which at the default cycle-on-restart cadence may only cover days or weeks. Many administrators use a weekly log cycle (e.g., Ola Hallengren's maintenance solution includes an sp_cycle_errorlog step). With weekly cycling, 26 files = 6 months of history."
        query=@"
 DECLARE @N INT;
 EXEC master.sys.xp_instance_regread N'HKEY_LOCAL_MACHINE',N'Software\Microsoft\MSSQLServer\MSSQLServer',N'NumErrorLogs',@N OUTPUT;
-IF ISNULL(@N, 6) < 12
-    SELECT 'Only ' + CAST(ISNULL(@N, 6) AS VARCHAR(10)) + ' error log files configured. Security history may be lost.' AS details,
-        'Increase to 12-52 files for adequate forensic history.' AS actionStep;
+SET @N = ISNULL(@N, 6);
+IF @N < 26
+    SELECT 'This instance is configured for ' + CAST(@N AS VARCHAR(10)) + ' error log files (default is 6). '
+        + CASE
+            WHEN @N <= 6 THEN 'At the default cycle-on-restart cadence, this may only retain days or weeks of login failure history — not enough for forensic review after a breach.'
+            WHEN @N <= 12 THEN 'This is better than the default, but may only cover 2-3 months if logs are cycled weekly.'
+            ELSE 'This provides partial coverage but falls short of the recommended 6-month retention.'
+          END AS details,
+        'We recommend configuring at least 26 error log files to retain approximately 6 months of security event history. '
+        + 'If you are not already cycling logs on a schedule, consider adding a weekly SQL Agent job that runs EXEC sp_cycle_errorlog (Ola Hallengren''s maintenance solution includes this as a step). '
+        + 'To change the retention count: EXEC xp_instance_regwrite N''HKEY_LOCAL_MACHINE'', N''Software\Microsoft\MSSQLServer\MSSQLServer'', N''NumErrorLogs'', REG_DWORD, 26; '
+        + 'Or set it in SSMS under Management > SQL Server Logs > right-click > Configure.' AS actionStep;
 "@ }
 
     @{ id=2013; name="Linked server with sa"; category="Configuration & Surface Area"; severity="High"
@@ -381,6 +391,209 @@ WHERE j.enabled = 1 AND SUSER_SNAME(j.owner_sid) <> SUSER_SNAME(0x01) AND SUSER_
 IF CAST(SERVERPROPERTY('ProductMajorVersion') AS INT) < 13 AND SERVERPROPERTY('EngineEdition') <> 8
     SELECT 'This SQL Server version is no longer supported by Microsoft. No future security updates.' AS details,
         'Upgrade to SQL Server 2016 or later.' AS actionStep;
+"@ }
+
+
+    # -- ENCRYPTION & DATA PROTECTION --
+
+    @{ id=3001; name="Backup encryption not enabled"; category="Encryption & Data Protection"; severity="Medium"
+       description="Checks recent full backups for user databases to determine if any were written without encryption. Unencrypted backups expose data at rest if backup media is lost or stolen."
+       minVersion=12
+       query=@"
+;WITH LatestBackups AS (
+    SELECT database_name, encryptor_type, key_algorithm,
+        ROW_NUMBER() OVER (PARTITION BY database_name ORDER BY backup_finish_date DESC) AS rn
+    FROM msdb.dbo.backupset
+    WHERE type = 'D' AND database_name NOT IN ('master','model','msdb','tempdb')
+)
+SELECT 'The most recent full backup of [' + database_name COLLATE DATABASE_DEFAULT + '] is not encrypted.' AS details,
+    'Enable backup encryption using a certificate or asymmetric key. Example: BACKUP DATABASE [' + database_name COLLATE DATABASE_DEFAULT + '] TO DISK = ''...'' WITH ENCRYPTION(ALGORITHM = AES_256, SERVER CERTIFICATE = [YourBackupCert]).' AS actionStep,
+    database_name COLLATE DATABASE_DEFAULT AS databaseName
+FROM LatestBackups
+WHERE rn = 1 AND encryptor_type IS NULL
+"@ }
+
+    @{ id=3002; name="TDE certificate never backed up"; category="Encryption & Data Protection"; severity="High"
+       description="Finds TDE encryption certificates that have never had their private key backed up. Without a backup, you cannot restore the encrypted database on another server."
+       query=@"
+SELECT 'The TDE certificate [' + c.name COLLATE DATABASE_DEFAULT + '] protecting database [' + DB_NAME(d.database_id) COLLATE DATABASE_DEFAULT + '] has never been backed up.' AS details,
+    'Back up the certificate immediately: BACKUP CERTIFICATE [' + c.name COLLATE DATABASE_DEFAULT + '] TO FILE = ''C:\Secure\' + c.name COLLATE DATABASE_DEFAULT + '.cer'' WITH PRIVATE KEY (FILE = ''C:\Secure\' + c.name COLLATE DATABASE_DEFAULT + '.pvk'', ENCRYPTION BY PASSWORD = ''<StrongPassword>''); Store the files and password in a secure offsite location.' AS actionStep,
+    DB_NAME(d.database_id) COLLATE DATABASE_DEFAULT AS databaseName
+FROM sys.certificates c
+INNER JOIN sys.dm_database_encryption_keys d ON c.thumbprint = d.encryptor_thumbprint
+WHERE c.pvt_key_last_backup_date IS NULL
+"@ }
+
+    @{ id=3003; name="TDE certificate expiring soon"; category="Encryption & Data Protection"; severity="Medium"
+       description="Finds TDE certificates that will expire within 90 days. While expired TDE certificates still function, rotating them is a security best practice."
+       query=@"
+SELECT 'The TDE certificate [' + c.name COLLATE DATABASE_DEFAULT + '] for database [' + DB_NAME(d.database_id) COLLATE DATABASE_DEFAULT + '] expires on ' + CONVERT(VARCHAR(20), c.expiry_date, 120) + '.' AS details,
+    'Rotate the TDE certificate before expiration. Create a new certificate, alter the database encryption key to use it, then back up the new certificate.' AS actionStep,
+    DB_NAME(d.database_id) COLLATE DATABASE_DEFAULT AS databaseName
+FROM sys.certificates c
+INNER JOIN sys.dm_database_encryption_keys d ON c.thumbprint = d.encryptor_thumbprint
+WHERE c.expiry_date <= DATEADD(DAY, 90, GETDATE())
+"@ }
+
+    @{ id=3004; name="Force Encryption off with self-signed cert"; category="Encryption & Data Protection"; severity="Medium"
+       description="When Force Encryption is disabled and the instance uses a self-signed certificate, client connections may fall back to unencrypted communication. Checks the registry for the Force Encryption flag and whether a custom certificate thumbprint has been configured."
+       query=@"
+DECLARE @FE INT, @CertHash NVARCHAR(256);
+EXEC xp_instance_regread 'HKEY_LOCAL_MACHINE','Software\Microsoft\Microsoft SQL Server\MSSQLServer\SuperSocketNetLib','ForceEncryption',@FE OUTPUT;
+EXEC xp_instance_regread 'HKEY_LOCAL_MACHINE','Software\Microsoft\Microsoft SQL Server\MSSQLServer\SuperSocketNetLib','Certificate',@CertHash OUTPUT;
+IF ISNULL(@FE, 0) = 0 AND (ISNULL(@CertHash, '') = '' OR LEN(@CertHash) < 10)
+    SELECT 'Force Encryption is OFF and no custom TLS certificate is configured. SQL Server is using a self-signed certificate, and clients can connect without encryption.' AS details,
+        'Install a CA-issued TLS certificate on the server, configure it in SQL Server Configuration Manager, and enable Force Encryption. This ensures all connections are encrypted with a trusted certificate.' AS actionStep;
+"@ }
+
+    @{ id=3005; name="Backup certificate never backed up"; category="Encryption & Data Protection"; severity="High"
+       description="Finds certificates used for backup encryption that have never had their private key backed up. Without a backup, encrypted backups cannot be restored on another server."
+       minVersion=12
+       query=@"
+SELECT DISTINCT 'The backup encryption certificate [' + c.name COLLATE DATABASE_DEFAULT + '] used by database [' + b.database_name COLLATE DATABASE_DEFAULT + '] has never been backed up.' AS details,
+    'Back up this certificate and its private key immediately to a secure offsite location.' AS actionStep,
+    b.database_name COLLATE DATABASE_DEFAULT AS databaseName
+FROM sys.certificates c
+INNER JOIN msdb.dbo.backupset b ON c.thumbprint = b.encryptor_thumbprint
+WHERE c.pvt_key_last_backup_date IS NULL AND b.encryptor_thumbprint IS NOT NULL
+"@ }
+
+
+    # -- NETWORK & CONNECTIVITY --
+
+    @{ id=4001; name="SQL Browser service running"; category="Network & Connectivity"; severity="Low"
+       description="Checks if the SQL Server Browser service is running. The Browser service responds to UDP 1434 queries and advertises all SQL Server instances, their names, and port numbers to anyone on the network."
+       query=@"
+SELECT 'The SQL Server Browser service is running, advertising instance names and ports on UDP 1434 to anyone on the network.' AS details,
+    'If all applications connect using explicit server\instance or server,port syntax, consider stopping and disabling the SQL Browser service to reduce network exposure. If named instances require dynamic port discovery, restrict network access to UDP 1434 via firewall rules.' AS actionStep
+FROM sys.dm_server_services
+WHERE servicename LIKE 'SQL Server Browser%' AND status = 4
+"@ }
+
+    @{ id=4002; name="Default port 1433 in use"; category="Network & Connectivity"; severity="Low"
+       description="Checks whether the instance is listening on the well-known default port 1433. Automated scanners and worms target this port specifically."
+       query=@"
+IF EXISTS (
+    SELECT 1 FROM sys.dm_exec_connections
+    WHERE local_tcp_port = 1433 AND session_id = @@SPID
+)
+    SELECT 'This instance is listening on the default port 1433, which is the first port targeted by automated SQL Server scanners and worms.' AS details,
+        'Consider changing to a non-standard port in SQL Server Configuration Manager. Update connection strings and firewall rules accordingly. This is defense-in-depth — it won''t stop a determined attacker but eliminates drive-by scanning.' AS actionStep;
+"@ }
+
+    @{ id=4003; name="Multiple IP addresses listening"; category="Network & Connectivity"; severity="Low"
+       description="Checks if SQL Server is configured to listen on all IP addresses (0.0.0.0). In multi-NIC environments, this may expose SQL Server on interfaces that should not have database access (e.g., a management or backup network)."
+       query=@"
+DECLARE @ListenAll INT;
+EXEC xp_instance_regread 'HKEY_LOCAL_MACHINE','Software\Microsoft\Microsoft SQL Server\MSSQLServer\SuperSocketNetLib','ListenOnAllIPs',@ListenAll OUTPUT;
+IF ISNULL(@ListenAll, 1) = 1
+    SELECT 'SQL Server is configured to listen on ALL IP addresses. On servers with multiple network interfaces, this may expose the instance on networks where database access is not intended (e.g., backup, management, or public-facing NICs).' AS details,
+        'In SQL Server Configuration Manager, under TCP/IP Properties, set Listen All to No, then enable only the specific IP addresses that should accept database connections.' AS actionStep;
+"@ }
+
+
+    # -- VULNERABILITY MANAGEMENT --
+
+    @{ id=5001; name="Dynamic Data Masking not in use"; category="Vulnerability Management"; severity="Low"
+       description="Checks whether any user databases have Dynamic Data Masking rules configured. DDM is a built-in feature (SQL 2016+) that masks sensitive data from non-privileged users without changing stored data. This check reports if the feature is completely unused across all user databases."
+       minVersion=13
+       query=@"
+IF NOT EXISTS (
+    SELECT 1 FROM sys.databases d
+    CROSS APPLY (
+        SELECT TOP 1 1 AS x FROM sys.masked_columns WHERE is_masked = 1
+    ) mc
+    WHERE d.database_id = DB_ID() AND d.database_id > 4
+)
+AND (SELECT COUNT(*) FROM sys.databases WHERE database_id > 4 AND state = 0) > 0
+    SELECT 'No Dynamic Data Masking rules are configured in the current database. DDM can protect sensitive columns (SSN, email, credit card) from non-privileged users without application changes.' AS details,
+        'Review tables for columns containing PII or sensitive data and apply masking rules. Example: ALTER TABLE dbo.Customers ALTER COLUMN SSN ADD MASKED WITH (FUNCTION = ''partial(0,"XXX-XX-",4)''); Non-privileged users will see masked values, while UNMASK permission holders see actual data.' AS actionStep;
+"@ }
+
+    @{ id=5002; name="Row-Level Security not in use"; category="Vulnerability Management"; severity="Low"
+       description="Checks whether any security policies (Row-Level Security) exist in user databases. RLS is valuable for multi-tenant databases where row-level isolation should not depend solely on application logic."
+       minVersion=13
+       query=@"
+IF NOT EXISTS (SELECT 1 FROM sys.security_policies)
+AND (SELECT COUNT(*) FROM sys.databases WHERE database_id > 4 AND state = 0) > 0
+    SELECT 'No Row-Level Security policies are configured in the current database. If this instance hosts multi-tenant data or role-based data access, RLS enforces row filtering at the database engine level rather than relying solely on application logic.' AS details,
+        'Evaluate whether any tables contain data that should be filtered by user or tenant. RLS creates a security policy with a filter predicate function that automatically restricts which rows each user can access. This provides defense-in-depth even if the application layer has bugs.' AS actionStep;
+"@ }
+
+    @{ id=5003; name="SQL Vulnerability Assessment not configured"; category="Vulnerability Management"; severity="Low"
+       description="Checks for the presence of SQL Vulnerability Assessment scan results. VA is built into SSMS 17.4+ and Azure SQL, providing automated security scanning against a knowledge base of known vulnerabilities."
+       query=@"
+IF NOT EXISTS (SELECT 1 FROM sys.dm_server_audit_status WHERE name LIKE '%VA%' OR name LIKE '%vulnerability%')
+AND NOT EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE name LIKE '%vulnerability%' OR name LIKE '%VA scan%')
+    SELECT 'No SQL Vulnerability Assessment scans appear to be configured. VA is a built-in scanning service available in SSMS 17.4+ and Azure SQL Database that checks for security misconfigurations, excessive permissions, and unprotected sensitive data.' AS details,
+        'Open SSMS, right-click a database > Tasks > Vulnerability Assessment > Scan for Vulnerabilities. Configure a baseline and schedule recurring scans. For on-premises instances, scan results are stored locally. For Azure SQL, results integrate with Microsoft Defender for Cloud.' AS actionStep;
+"@ }
+
+
+    # -- OPERATIONAL SECURITY --
+
+    @{ id=6001; name="EXECUTE AS LOGIN in stored procedures"; category="Operational Security"; severity="Medium"
+       description="Finds stored procedures in user databases that use EXECUTE AS with a login context, which allows the procedure to run with elevated server-level permissions regardless of who calls it."
+       query=@"
+SELECT 'Procedure [' + DB_NAME() + '].[' + s.name COLLATE DATABASE_DEFAULT + '].[' + p.name COLLATE DATABASE_DEFAULT + '] uses EXECUTE AS LOGIN, running with server-level permissions of the specified login regardless of the caller.' AS details,
+    'Review whether EXECUTE AS LOGIN is necessary. If only database-level elevation is needed, use EXECUTE AS USER instead. If server-level access is required, consider using certificate-signed modules with specific server permissions.' AS actionStep
+FROM sys.sql_modules m
+INNER JOIN sys.procedures p ON m.object_id = p.object_id
+INNER JOIN sys.schemas s ON p.schema_id = s.schema_id
+WHERE m.execute_as_principal_id IS NOT NULL
+    AND m.execute_as_principal_id <> -2
+    AND EXISTS (SELECT 1 FROM sys.server_principals sp WHERE sp.principal_id = m.execute_as_principal_id)
+"@ }
+
+    @{ id=6002; name="Agent proxy accounts with sysadmin credentials"; category="Operational Security"; severity="High"
+       description="Finds SQL Agent proxy accounts whose underlying credential maps to a login that is a member of the sysadmin role. Job steps using these proxies run with full sysadmin-level OS access."
+       query=@"
+SELECT 'Agent proxy [' + p.name COLLATE DATABASE_DEFAULT + '] uses credential [' + c.name COLLATE DATABASE_DEFAULT + '] mapped to [' + c.credential_identity COLLATE DATABASE_DEFAULT + '], which is a sysadmin. Job steps using this proxy execute with full admin-level OS access.' AS details,
+    'Review whether this proxy needs sysadmin-level access. Create a dedicated low-privilege credential for the proxy, or restrict which job steps can use it via msdb.dbo.sp_grant_proxy_to_subsystem.' AS actionStep
+FROM msdb.dbo.sysproxies p
+INNER JOIN sys.credentials c ON p.credential_id = c.credential_id
+WHERE IS_SRVROLEMEMBER('sysadmin', c.credential_identity) = 1
+    AND p.enabled = 1
+"@ }
+
+    @{ id=6003; name="Database Mail public profile access"; category="Operational Security"; severity="Medium"
+       description="Finds Database Mail profiles configured as public (accessible to any database user). A compromised low-privilege user could abuse public mail profiles for phishing, spam, or data exfiltration via email attachments."
+       query=@"
+SELECT 'Database Mail profile [' + p.name COLLATE DATABASE_DEFAULT + '] is configured as a public profile, accessible to any database user in msdb.' AS details,
+    'Make the profile private and grant access only to specific database principals or roles that need to send mail: EXECUTE msdb.dbo.sysmail_update_principalprofile_sp @principal_name = ''public'', @profile_name = ''' + p.name COLLATE DATABASE_DEFAULT + ''', @is_default = 0; Then grant to specific users.' AS actionStep
+FROM msdb.dbo.sysmail_principalprofile pp
+INNER JOIN msdb.dbo.sysmail_profile p ON pp.profile_id = p.profile_id
+WHERE pp.principal_sid = 0x00 AND pp.is_default = 1
+"@ }
+
+    @{ id=6004; name="Guest user enabled in user databases"; category="Operational Security"; severity="Medium"
+       description="Checks for user databases where the guest user has CONNECT permission. This allows any server login to access the database without an explicit database user mapping."
+       query=@"
+SELECT 'The guest user has CONNECT permission in database [' + d.name COLLATE DATABASE_DEFAULT + '], allowing any authenticated login to access this database without an explicit user mapping.' AS details,
+    'Revoke guest access unless specifically required: USE [' + d.name COLLATE DATABASE_DEFAULT + ']; REVOKE CONNECT FROM guest;' AS actionStep,
+    d.name COLLATE DATABASE_DEFAULT AS databaseName
+FROM sys.databases d
+WHERE d.database_id > 4 AND d.state = 0
+AND EXISTS (
+    SELECT 1 FROM sys.database_permissions dp
+    INNER JOIN sys.database_principals pr ON dp.grantee_principal_id = pr.principal_id
+    WHERE pr.name = 'guest' AND dp.permission_name = 'CONNECT' AND dp.state = 'G'
+    AND DB_ID() = d.database_id
+)
+"@ }
+
+    @{ id=6005; name="Agent jobs with CmdExec or PowerShell steps"; category="Operational Security"; severity="Medium"
+       description="Finds enabled SQL Agent jobs that contain CmdExec or PowerShell job steps. These steps execute operating system commands and can be used for privilege escalation or lateral movement if the Agent service account is over-privileged."
+       query=@"
+SELECT 'Job [' + j.name COLLATE DATABASE_DEFAULT + '] has a ' +
+    CASE js.subsystem
+        WHEN 'CmdExec' THEN 'CmdExec (OS command)'
+        WHEN 'PowerShell' THEN 'PowerShell'
+    END + ' step [' + js.step_name COLLATE DATABASE_DEFAULT + '] that executes under the Agent service account or a proxy.' AS details,
+    'Review the command in this step. If the step uses the Agent service account (no proxy), it runs with the full OS permissions of that account. Consider assigning a least-privilege proxy or replacing with a T-SQL alternative.' AS actionStep
+FROM msdb.dbo.sysjobs j
+INNER JOIN msdb.dbo.sysjobsteps js ON j.job_id = js.job_id
+WHERE j.enabled = 1 AND js.subsystem IN ('CmdExec', 'PowerShell')
 "@ }
 
 
